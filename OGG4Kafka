@@ -1,0 +1,225 @@
+0.Env list:
+Oracle Linux:6.10
+Oracle DB 11.2.0.4
+OGG4Ora:19.1
+OGG4BD:19.1
+
+1.Install package for OCI instance:
+yum groupinstall "X Window System"
+yum install oracle-rdbms-server-11gR2-preinstall
+Yum install java
+yum -y groupinstall kde-desktop
+yum install -y java-1.8.0-openjdk.x86_64
+yum install tiger-vncserver
+https://scriptingmysql.wordpress.com/2019/11/22/how-to-setup-a-gui-via-vnc-for-your-oracle-linux-compute-instance-in-oracle-cloud-infrastructure-oci/
+
+2.OS Configuration
+
+a.service iptables stop
+
+b.profile:
+#!/bin/bash
+ORACLE_HOME=/u01/app/oracle/product/11.2.0/dbhome_1;  export ORACLE_HOME
+ORACLE_SID=orcl; export ORACLE_SID
+export JAVA_HOME=/usr/java/latest
+export JRE_HOME=/usr/java/latest/jre
+PATH=$JAVA_HOME/bin:$ORACLE_HOME/bin:$PATH ; export PATH
+CLASSPATH=$ORACLE_HOME/JRE:$ORACLE_HOME/jlib:$ORACLE_HOME/rdbms/jlib:$JAVA_HOME/lib:
+LD_LIBRARY_PATH=$ORACLE_HOME/lib:/u01/ogg4ora/jdk/jre/lib/amd64/server/:/lib:/usr/lib; export LD_LIBRARY_PATH
+alias db='sqlplus ogg/ogg'
+alias sys='sqlplus / as sysdba'
+alias ggsci='/u01/ogg4ora/ggsci'
+alias ggbd='/u01/ogg4bd/ggsci'
+
+c.java -version
+[oracle@instance-20191126-0838 kafka_2.12-2.3.0]$ java -version
+java version "1.8.0_231"
+Java(TM) SE Runtime Environment (build 1.8.0_231-b11)
+Java HotSpot(TM) 64-Bit Server VM (build 25.231-b11, mixed mode)
+d.Ingress Rules:
+Open ports for :5901,1521,7909,7819,2181,9092
+
+3. Enable OGG for Oracle DB 11.2.0.4
+
+a.源端数据库打开Archive Log:
+	SQL>shutdown immediate;
+	SQL>startup mount;
+	SQL>alter database archivelog;
+	SQL>alter database open;
+	SQL>archive log list;
+
+b.源端数据库打开数据库级最小附加日志及force logging：
+	SQL>SELECT supplemental_log_data_min, force_logging FROM v$database;
+	SQL>alter database add supplemental log data;
+	SQL>alter database force logging;
+	切换日志以使附加日志生效：
+	SQL>ALTER SYSTEM switch logfile;
+	
+c.Enabling Oracle GoldenGate in the Database:
+	SQL> show parameter enable_goldengate_replication
+	SQL> alter system set Enable_goldengate_replication = true scope=both;	
+
+d.在源端创建用户并授权
+e.在源端数据库创建GoldenGate用户：
+SQL> create user ogg identified by ogg;
+SQL>GRANT DBA to ogg;
+SQL> BEGIN 
+  dbms_goldengate_auth.grant_admin_privilege 
+  ( 
+    grantee => 'ogg', 
+    privilege_type => 'CAPTURE', 
+    grant_select_privileges => TRUE 
+  ); 
+END; 
+/ 
+
+
+4.OGG Settings:
+a.OGG4Ora
+OGG Home:/u01/ogg4ora
+b.Extract:
+extract extora
+userid ogg@orcl, password ogg
+exttrail ./dirdat/tm
+table hr.*;
+
+c.Pump:
+extract pumora
+passthru
+rmthost 132.145.122.141, mgrport 7909
+rmttrail ./dirdat/pn
+table hr.*;
+
+d.Mgr:
+port 7809
+
+e.Groups adding:
+在OGG中添加表级附加日志
+GGSCI>dblogin userid ogg password ogg
+GGSCI>add trandata hr.* ALLCOLS
+
+GGSCI>create subdirs
+GGSCI>add extract extora,tranlog,begin now
+GGSCI>add exttrail ./dirdat/tm,extract extora,megabytes 10
+GGSCI>info extract extora
+GGSCI> add extract pumora,exttrailsource ./dirdat/tm
+GGSCI> add rmttrail ./dirdat/pn,extract pumora,megabytes 10
+
+f.OGG4BD
+OGG Home: /u01/ogg4bd/
+g.Add /u01/ogg4ora/jdk/jre/lib/amd64/server/ into LD_LIBRARY_PATH.
+LD_LIBRARY_PATH=$ORACLE_HOME/lib:/u01/ogg4ora/jdk/jre/lib/amd64/server/:/lib:/usr/lib; export LD_LIBRARY_PATH
+
+
+h.Copy 3 sample file from /u01/ogg4bd/AdapterExamples/big-data/kafka to OGG Home/dirprm
+They are kafka.props ,custom_kafka_producer.properties and rkafka.prm
+i:And edit:kafka.props
+cat kafka.props
+
+gg.handlerlist = kafkahandler
+gg.handler.kafkahandler.type=kafka
+gg.handler.kafkahandler.KafkaProducerConfigFile=custom_kafka_producer.properties
+#The following resolves the topic name using the short table name
+gg.handler.kafkahandler.topicMappingTemplate=ogg_topic
+#The following selects the message key using the concatenated primary keys
+#gg.handler.kafkahandler.keyMappingTemplate=${primaryKeys}
+gg.handler.kafkahandler.format=json
+#gg.handler.kafkahandler.SchemaTopicName=mySchemaTopic
+gg.handler.kafkahandler.BlockingSend =false
+gg.handler.kafkahandler.includeTokens=false
+gg.handler.kafkahandler.mode=op
+#gg.handler.kafkahandler.MetaHeaderTemplate=${alltokens}
+gg.handler.kafkahandler.format.insertOpKey = I
+gg.handler.kafkahandler.format.updateOpKey = U
+gg.handler.kafkahandler.format.deleteOpKey = D
+
+
+goldengate.userexit.writers=javawriter
+javawriter.stats.display=TRUE
+javawriter.stats.full=TRUE
+
+gg.log=log4j
+gg.log.level=INFO
+
+gg.report.time=30sec
+
+#Sample gg.classpath for Apache Kafka
+gg.classpath=dirprm/:/u01/kafka/kafka_2.12-2.3.0/libs/*:/u01/ogg4bd/:/u01/ogg4bd/lib/*
+#Sample gg.classpath for HDP
+#gg.classpath=/etc/kafka/conf:/usr/hdp/current/kafka-broker/libs/*
+
+javawriter.bootoptions=-Xmx512m -Xms32m -Djava.class.path=ggjava/ggjava.jar
+
+j.custom_kafka_producer.properties:
+[oracle@instance-20191126-0838 dirprm]$ cat custom_kafka_producer.properties
+bootstrap.servers=localhost:9092
+acks=1
+reconnect.backoff.ms=1000
+
+value.serializer=org.apache.kafka.common.serialization.ByteArraySerializer
+key.serializer=org.apache.kafka.common.serialization.ByteArraySerializer
+# 100KB per partition
+batch.size=16384
+linger.ms=10000
+
+
+k.Replicat:
+GGSCI (instance-20191126-0838) 3> view param RKAFKA
+
+REPLICAT rkafka
+-- Trail file for this example is located in "AdapterExamples/trail" directory
+-- Command to add REPLICAT
+-- add replicat rkafka, exttrail AdapterExamples/trail/tr
+TARGETDB LIBFILE libggjava.so SET property=dirprm/kafka.props
+REPORTCOUNT EVERY 1 MINUTES, RATE
+GROUPTRANSOPS 10000
+MAP HR.*, TARGET HR.*;
+
+l:GGSCI (instance-20191126-0838) 1> view param ./GLOBALS
+
+CHECKPOINTTABLE ogg.chkpt
+GGSCI> dblogin userid ogg,password ogg;
+GGSCI>add CHECKPOINTTABLE ogg.chkpt
+m:Group adding:
+add replicat rkafka, exttrail /u01/ogg4bd/dirdat/pn
+
+https://dongkelun.com/2018/05/23/oggOracle2Kafka/
+
+5.Kafka install:
+a. Download the image:
+wget http://mirrors.hust.edu.cn/apache/kafka/2.3.0/kafka_2.12-2.3.0.tgz
+b.tar -xzf kafka_2.12-2.3.0.tgz
+c. Start the ZooKeeper and Kafka Server
+https://kafka.apache.org/quickstart
+Change directory to Kakfa Home:
+/u01/kafka/kafka_2.12-2.3.0
+
+Step 1: Start the server
+
+Kafka uses ZooKeeper so you need to first start a ZooKeeper server if you don't already have one. You can use the convenience script packaged with kafka to get a quick-and-dirty single-node ZooKeeper instance.
+
+> bin/zookeeper-server-start.sh config/zookeeper.properties
+
+Step 2:Now start the Kafka server:
+
+> bin/kafka-server-start.sh config/server.properties
+
+Step 3: Create a test topic (Optional)
+Let's create a topic named "test" with a single partition and only one replica:
+
+> bin/kafka-topics.sh --create --bootstrap-server localhost:9092 --replication-factor 1 --partitions 1 --topic test
+We can now see that topic if we run the list topic command:
+
+> bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+test
+Step 4: Consume the Kafka topic
+
+bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic oggtopic --from-beginning
+
+HR_REP▒V
+{"table":"HR.JOBS","op_type":"U","op_ts":"2019-11-26 07:42:09.000394","current_ts":"2019-11-26T07:42:14.039000","pos":"00000000010000002592","before":{"JOB_ID":"HR_REP","JOB_TITLE":"Human Resources Representative","MIN_SALARY":5555,"MAX_SALARY":9000},"after":{"JOB_ID":"HR_REP","MIN_SALARY":666}}
+
+
+./kafka-server-start.sh ../config/server.properties
+
+./zookeeper-server-start.sh -daemon zookeeper.properties
